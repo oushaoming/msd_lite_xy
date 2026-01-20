@@ -29,10 +29,11 @@ Support the author
 * BSD License
 * No deadlocks threads during operation
 * Receiving only udp-multicast, including rtp streams
+* HTTP to HTTP proxy support (via /http:// prefix)
 * Not available options URL: precache and blocksize
 * Zero Copy on Send (ZCoS) is always on
 * No polling to send out to clients fUsePollingForSend
-* No analyzer MPEG2-TS stream, and “smart” shipping MPEG2-TS header new clients
+* No analyzer MPEG2-TS stream, and "smart" shipping MPEG2-TS header new clients
 
 
 
