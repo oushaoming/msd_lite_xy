@@ -39,7 +39,6 @@
 //#include <arpa/inet.h>
 #include <net/if.h>
 #include <netinet/tcp.h>
-#include <netdb.h> /* for addrinfo, getaddrinfo, freeaddrinfo */
 
 #include <err.h>
 #include <errno.h>
@@ -112,44 +111,14 @@ int		msd_src_conn_profile_load(const uint8_t *data, size_t data_size,
 
 
 
-int		msd_http_srv_hub_attach(http_srv_cli_p cli, uint8_t *hub_name, size_t hub_name_size,
+int		msd_http_srv_hub_attach(http_srv_cli_p cli,
+		    uint8_t *hub_name, size_t hub_name_size,
 		    str_src_conn_params_p src_conn_params);
-uint32_t	msd_http_req_url_parse(http_srv_req_p req, struct sockaddr_storage *ssaddr,
+uint32_t	msd_http_req_url_parse(http_srv_req_p req,
+		    struct sockaddr_storage *ssaddr,
 		    uint32_t *if_index, uint32_t *rejoin_time,
-		    uint8_t *hub_name, size_t hub_name_size, size_t *hub_name_size_ret);
-
-/* HTTP to HTTP proxy functions */
-
-/* Proxy session structure */
-typedef struct msd_http_proxy_session_s {
-	http_srv_cli_p cli;
-	tp_task_p client_tptask;
-	tp_task_p target_tptask;
-	uintptr_t client_skt;
-	uintptr_t target_skt;
-	char method[16];
-	char url[MAXPATHLEN];
-	char host[256];
-	int port;
-	char modified_request[4096];
-	size_t modified_request_size;
-	char recv_buf[4096];
-	size_t recv_buf_size;
-	int state;
-} msd_http_proxy_session_t, *msd_http_proxy_session_p;
-
-/* Session states */
-#define MSD_HTTP_PROXY_STATE_CONNECTING 0
-#define MSD_HTTP_PROXY_STATE_SENDING_REQUEST 1
-#define MSD_HTTP_PROXY_STATE_FORWARDING 2
-
-int		msd_http_proxy_parse_request(http_srv_req_p req, char *method, char *url, char *host, int *port);
-int		msd_http_proxy_connect_target(const char *host, int port);
-static int	msd_http_proxy_on_target_read(tp_task_p tptask, int error, uint32_t eof,
-		    size_t data2transfer_size, void *arg);
-static int	msd_http_proxy_on_client_read(tp_task_p tptask, int error, uint32_t eof,
-		    size_t data2transfer_size, void *arg);
-static void	msd_http_proxy_cleanup(void *arg);
+		    uint8_t *hub_name, size_t hub_name_size,
+		    size_t *hub_name_size_ret);
 
 
 static int	msd_http_srv_on_req_rcv_cb(http_srv_cli_p cli, void *udata,
@@ -394,7 +363,7 @@ main(int argc, char *argv[]) {
 		goto err_out;
 	}
 	http_srv_def_settings(1, PACKAGE_NAME"/"PACKAGE_VERSION, 1, &http_s);
-	http_s.req_p_flags = (HTTP_SRV_REQ_P_F_CONNECTION | HTTP_SRV_REQ_P_F_HOST | HTTP_SRV_REQ_P_F_HOST_ANY_PORT);
+	http_s.req_p_flags = (HTTP_SRV_REQ_P_F_CONNECTION | HTTP_SRV_REQ_P_F_HOST_ANY_PORT);
 	http_s.resp_p_flags = (HTTP_SRV_RESP_P_F_CONN_CLOSE | HTTP_SRV_RESP_P_F_SERVER | HTTP_SRV_RESP_P_F_CONTENT_LEN);
 	ccb.on_req_rcv = msd_http_srv_on_req_rcv_cb;
 	ccb.on_rep_snd = NULL;
@@ -551,14 +520,21 @@ msd_http_req_url_parse(http_srv_req_p req, struct sockaddr_storage *ssaddr,
 	uint32_t ifindex, rejointime;
 	char straddr[STR_ADDR_LEN], ifname[(IFNAMSIZ + 1)];
 	struct sockaddr_storage ss;
+	char url_buf[1024] = {0};
 
 	SYSLOGD_EX(LOG_DEBUG, "...");
 
 	if (NULL == req || NULL == hub_name || 0 == hub_name_size)
 		return (500);
 	/* Get multicast address. */
-	if (0 != sa_addr_port_from_str(&ss, (const char*)(req->line.abs_path + 5),
-	    (req->line.abs_path_size - 5)))
+	// 处理 URL 中的 $ 字符
+	memcpy(url_buf, req->line.abs_path + 5, req->line.abs_path_size - 5);
+	url_buf[req->line.abs_path_size - 5] = '\0';
+	char* dollar_pos = strchr(url_buf, '$');
+	if (dollar_pos) {
+		*dollar_pos = '\0';
+	}
+	if (0 != sa_addr_port_from_str(&ss, url_buf, strlen(url_buf)))
 		return (400);
 	if (0 == sa_port_get(&ss)) { /* Def udp port. */
 		sa_port_set(&ss, 1234);
@@ -639,10 +615,11 @@ msd_http_srv_on_req_rcv_cb(http_srv_cli_p cli, void *udata __unused,
 		resp->status_code = 400;
 		return (HTTP_SRV_CB_CONTINUE);
 	}
-	if (0 == (req->flags & HTTP_SRV_RD_F_HOST_IS_LOCAL)) {
-		resp->status_code = 403;
-		return (HTTP_SRV_CB_CONTINUE);
-	}
+	// 移除 host 检查
+	// if (0 == (req->flags & HTTP_SRV_RD_F_HOST_IS_LOCAL)) {
+	// 	resp->status_code = 403;
+	// 	return (HTTP_SRV_CB_CONTINUE);
+	// }
 
 	/* Statistic request. */
 	if (HTTP_REQ_METHOD_GET == req->line.method_code &&
@@ -705,355 +682,9 @@ msd_http_srv_on_req_rcv_cb(http_srv_cli_p cli, void *udata __unused,
 		/* Will send reply later... */
 		return (HTTP_SRV_CB_NONE);
 	} /* "/udp/" / "/rtp/" */
-	
-	/* Check for HTTP to HTTP proxy request */
-	if (req->line.abs_path_size >= 8 && memcmp(req->line.abs_path, "/http://", 8) == 0) {
-		msd_http_proxy_session_p session;
-		char method[16];
-		char url[MAXPATHLEN];
-		char host[256];
-		int port;
-		const char *headers_start, *headers_end;
-		char *line_start, *line_end;
-		int error;
-		
-		/* Parse the request */
-		if (msd_http_proxy_parse_request(req, method, url, host, &port) != 0) {
-			resp->status_code = 400;
-			return (HTTP_SRV_CB_CONTINUE);
-		}
-		
-		/* Create proxy session */
-		session = calloc(1, sizeof(msd_http_proxy_session_t));
-		if (NULL == session) {
-			resp->status_code = 500;
-			return (HTTP_SRV_CB_CONTINUE);
-		}
-		
-		/* Initialize session */
-		session->cli = cli;
-		session->client_skt = tp_task_ident_get(http_srv_cli_get_tptask(cli));
-		session->client_tptask = http_srv_cli_get_tptask(cli);
-		session->target_skt = (uintptr_t)-1;
-		session->state = MSD_HTTP_PROXY_STATE_CONNECTING;
-		strcpy(session->method, method);
-		strcpy(session->url, url);
-		strcpy(session->host, host);
-		session->port = port;
-		
-		/* Build modified request */
-		/* Start with request line */
-		snprintf(session->modified_request, sizeof(session->modified_request),
-		         "%s %s HTTP/1.1\r\n", method, url);
-		
-		/* Find headers */
-		headers_start = (const char*)(req->hdr);
-		headers_end = strstr(headers_start, "\r\n\r\n");
-		
-		if (headers_end) {
-			/* Copy headers except Host and Proxy-* headers */
-			line_start = (char*)headers_start;
-			while (line_start < headers_end) {
-				line_end = strstr(line_start, "\r\n");
-				if (!line_end) break;
-				
-				/* Skip Host and Proxy-* headers */
-				if (strncasecmp(line_start, "Host:", 5) != 0 && 
-				    strncasecmp(line_start, "Proxy-", 6) != 0) {
-					/* Copy this header */
-					size_t len = line_end - line_start + 2;
-					if (strlen(session->modified_request) + len < sizeof(session->modified_request)) {
-						memcpy(session->modified_request + strlen(session->modified_request), 
-						        line_start, len);
-					}
-				}
-				
-				line_start = line_end + 2;
-			}
-		}
-		
-		/* Add Host header */
-		if (port == 80) {
-			snprintf(session->modified_request + strlen(session->modified_request), 
-			         sizeof(session->modified_request) - strlen(session->modified_request),
-			         "Host: %s\r\n", host);
-		} else {
-			snprintf(session->modified_request + strlen(session->modified_request), 
-			         sizeof(session->modified_request) - strlen(session->modified_request),
-			         "Host: %s:%d\r\n", host, port);
-		}
-		
-		/* Add Connection: close */
-		strcat(session->modified_request, "Connection: close\r\n");
-		
-		/* End headers */
-		strcat(session->modified_request, "\r\n");
-		
-		session->modified_request_size = strlen(session->modified_request);
-		
-		/* Connect to target server */
-		int target_skt = msd_http_proxy_connect_target(host, port);
-		if (target_skt == -1) {
-			/* Connection failed */
-			const char* err = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nCannot connect to target server";
-			send((int)session->client_skt, err, strlen(err), 0);
-			msd_http_proxy_cleanup(session);
-			return (HTTP_SRV_CB_CONTINUE);
-		}
-		
-		/* Set socket to non-blocking mode */
-		fcntl(target_skt, F_SETFL, O_NONBLOCK);
-		
-		/* Create notify task for target socket */
-		/* Get thread pool from client task */
-		tp_task_p client_tptask = http_srv_cli_get_tptask(cli);
-		tpt_p client_tpt = tp_task_tpt_get(client_tptask);
-		tp_p tp = tpt_get_tp(client_tpt);
-		
-		error = tp_task_notify_create(tp_thread_get_rr(tp), 
-		                             (uintptr_t)target_skt, 
-		                             TP_TASK_F_CLOSE_ON_DESTROY, 
-		                             TP_EV_READ, /* Monitor for read events */
-		                             0, /* No timeout */
-		                             msd_http_proxy_on_target_read, 
-		                             session, &session->target_tptask);
-		if (0 != error) {
-			const char* err = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nCannot create proxy session";
-			send((int)session->client_skt, err, strlen(err), 0);
-			close(target_skt);
-			msd_http_proxy_cleanup(session);
-			return (HTTP_SRV_CB_CONTINUE);
-		}
-		
-		/* Send modified request to target */
-		session->target_skt = (uintptr_t)target_skt;
-		session->state = MSD_HTTP_PROXY_STATE_SENDING_REQUEST;
-		write(target_skt, session->modified_request, session->modified_request_size);
-		
-		/* Prevent HTTP server from closing the client socket */
-		tp_task_flags_del(session->client_tptask, TP_TASK_F_CLOSE_ON_DESTROY);
-		
-		/* Will handle the response later */
-		return (HTTP_SRV_CB_NONE);
-	} /* HTTP proxy */
 
 	/* URL not found. */
 	resp->status_code = 404;
 
 	return (HTTP_SRV_CB_CONTINUE);
-}
-
-
-/* HTTP to HTTP proxy implementation */
-
-int
-msd_http_proxy_parse_request(http_srv_req_p req, char *method, char *url, char *host, int *port) {
-	const char *target_url;
-	const char *slash_pos;
-	char host_port[512];
-
-	if (NULL == req || NULL == method || NULL == url || NULL == host || NULL == port) {
-		return -1;
-	}
-
-	/* Copy method */
-	memcpy(method, req->line.method, req->line.method_size);
-	method[req->line.method_size] = 0;
-
-	/* Check if it's a http proxy request */
-	if (req->line.abs_path_size < 8 || memcmp(req->line.abs_path, "/http://", 8) != 0) {
-		return -1;
-	}
-
-	target_url = (const char*)(req->line.abs_path + 8);
-	slash_pos = strchr(target_url, '/');
-	
-	if (!slash_pos) {
-		strncpy(url, "/", MAXPATHLEN - 1);
-		slash_pos = target_url + strlen(target_url);
-	} else {
-		strncpy(url, slash_pos, MAXPATHLEN - 1);
-		url[MAXPATHLEN - 1] = 0;
-	}
-
-	/* Extract host:port */
-	size_t host_len = slash_pos - target_url;
-	if (host_len > 0) {
-		memcpy(host_port, target_url, host_len);
-		host_port[host_len] = '\0';
-	} else {
-		strncpy(host_port, target_url, sizeof(host_port) - 1);
-		host_port[sizeof(host_port) - 1] = '\0';
-	}
-
-	/* Parse IPv6 address format [ipv6:address]:port */
-	if (host_port[0] == '[') {
-		const char* bracket_end = strchr(host_port, ']');
-		if (!bracket_end) {
-			return -1;
-		}
-		
-		int bracket_len = bracket_end - host_port - 1;
-		if (bracket_len >= 256) {
-			return -1;
-		}
-		
-		strncpy(host, host_port + 1, bracket_len);
-		host[bracket_len] = '\0';
-		
-		/* Check if there's a port number */
-		if (*(bracket_end + 1) == ':') {
-			*port = atoi(bracket_end + 2);
-			if (*port <= 0 || *port > 65535) {
-				*port = 80;
-			}
-		} else {
-			*port = 80;
-		}
-	} else {
-		/* IPv4 address or hostname */
-		char* colon_pos = strchr(host_port, ':');
-		if (colon_pos) {
-			*colon_pos = '\0';
-			strncpy(host, host_port, 255);
-			host[255] = '\0';
-			*port = atoi(colon_pos + 1);
-			if (*port <= 0) {
-				*port = 80;
-			}
-		} else {
-			strncpy(host, host_port, 255);
-			host[255] = '\0';
-			*port = 80;
-		}
-	}
-
-	return 0;
-}
-
-int
-msd_http_proxy_connect_target(const char *host, int port) {
-	struct addrinfo hints = {0};
-	struct addrinfo *result, *rp;
-	int sfd, s;
-
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = IPPROTO_TCP;
-
-	char port_str[16];
-	snprintf(port_str, sizeof(port_str), "%d", port);
-
-	s = getaddrinfo(host, port_str, &hints, &result);
-	if (s != 0) {
-		return -1;
-	}
-
-	/* Iterate through results and try to connect */
-	for (rp = result; rp != NULL; rp = rp->ai_next) {
-		sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-		if (sfd == -1) {
-			continue;
-		}
-
-		if (connect(sfd, rp->ai_addr, rp->ai_addrlen) != -1) {
-			/* Connection successful */
-			break;
-		}
-
-		close(sfd);
-		sfd = -1;
-	}
-
-	freeaddrinfo(result);
-
-	return sfd;
-}
-
-
-
-static int
-msd_http_proxy_on_target_read(tp_task_p tptask, int error, uint32_t eof, 
-				 size_t data2transfer_size, void *arg) {
-	msd_http_proxy_session_p session = (msd_http_proxy_session_p)arg;
-	ssize_t n;
-
-	if (0 != error || eof) {
-		/* Target connection closed or error */
-		shutdown((int)session->client_skt, SHUT_WR);
-		msd_http_proxy_cleanup(session);
-		return (TP_TASK_CB_NONE);
-	}
-
-	/* Read from target */
-	n = read((int)session->target_skt, session->recv_buf, sizeof(session->recv_buf));
-	if (n <= 0) {
-		/* Error or EOF */
-		shutdown((int)session->client_skt, SHUT_WR);
-		msd_http_proxy_cleanup(session);
-		return (TP_TASK_CB_NONE);
-	}
-
-	/* Forward to client */
-	if (write((int)session->client_skt, session->recv_buf, n) != n) {
-		/* Client write error */
-		msd_http_proxy_cleanup(session);
-		return (TP_TASK_CB_NONE);
-	}
-
-	return (TP_TASK_CB_CONTINUE);
-}
-
-static int
-msd_http_proxy_on_client_read(tp_task_p tptask, int error, uint32_t eof, 
-				 size_t data2transfer_size, void *arg) {
-	msd_http_proxy_session_p session = (msd_http_proxy_session_p)arg;
-	ssize_t n;
-
-	if (0 != error || eof) {
-		/* Client connection closed or error */
-		msd_http_proxy_cleanup(session);
-		return (TP_TASK_CB_NONE);
-	}
-
-	/* Read from client */
-	n = read((int)session->client_skt, session->recv_buf, sizeof(session->recv_buf));
-	if (n <= 0) {
-		/* Error or EOF */
-		msd_http_proxy_cleanup(session);
-		return (TP_TASK_CB_NONE);
-	}
-
-	/* Forward to target */
-	if (write((int)session->target_skt, session->recv_buf, n) != n) {
-		/* Target write error */
-		msd_http_proxy_cleanup(session);
-		return (TP_TASK_CB_NONE);
-	}
-
-	return (TP_TASK_CB_CONTINUE);
-}
-
-static void
-msd_http_proxy_cleanup(void *arg) {
-	msd_http_proxy_session_p session = (msd_http_proxy_session_p)arg;
-
-	if (session) {
-		if (session->client_tptask) {
-			tp_task_destroy(session->client_tptask);
-		}
-		if (session->target_tptask) {
-			tp_task_destroy(session->target_tptask);
-		}
-		if (session->client_skt != (uintptr_t)-1) {
-			close((int)session->client_skt);
-		}
-		if (session->target_skt != (uintptr_t)-1) {
-			close((int)session->target_skt);
-		}
-		if (session->cli) {
-			http_srv_cli_free(session->cli);
-		}
-		free(session);
-	}
 }
